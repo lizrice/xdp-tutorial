@@ -1,16 +1,22 @@
-# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
-
-XDP_TARGETS  := xdp_lb_kern
-USER_TARGETS :=
-
-LIBBPF_DIR = ../libbpf/src/
-COMMON_DIR = ../common
-
-COPY_LOADER := xdp_loader
-COPY_STATS  := xdp_stats
-
-include $(COMMON_DIR)/common.mk
-
-xdp:
+xdp: xdp_lb_kern.o
 	bpftool net detach xdpgeneric dev eth0
-	ip link set dev eth0 xdpgeneric obj xdp_lb_kern.o sec xdp_lb
+	rm -f /sys/fs/bpf/xdp_lb
+	bpftool prog load xdp_lb_kern.o /sys/fs/bpf/xdp_lb
+	bpftool net attach xdpgeneric pinned /sys/fs/bpf/xdp_lb dev eth0 
+
+xdp_lb_kern.o: xdp_lb_kern.c 
+	clang -S \
+	    -target bpf \
+	    -D __BPF_TRACING__ \
+	    -I../libbpf/src/build/usr/include/ -I../headers/ \
+	    -Wall \
+	    -Wno-unused-value \
+	    -Wno-pointer-sign \
+	    -Wno-compare-distinct-pointer-types \
+	    -Werror \
+	    -O2 -emit-llvm -c -o ${@:.o=.ll} $<
+	llc -march=bpf -filetype=obj -o $@ ${@:.o=.ll}
+
+
+
+

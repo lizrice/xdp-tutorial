@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #include <stddef.h>
 #include <linux/bpf.h>
 #include <linux/in.h>
@@ -6,126 +5,121 @@
 #include <linux/ip.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include "xdp_lb_kern.h"
 
-struct server
-{
-    unsigned char mac[ETH_ALEN];
-};
+#define BACKEND_A 2
+#define BACKEND_B 3
+#define CLIENT 4
+#define LB 5
 
-// Map will be indexed by the IP address and return the Ethernet address
-struct bpf_map_def SEC("maps") backends = {
-    .type = BPF_MAP_TYPE_HASH,
-    .key_size = sizeof(unsigned int),
-    .value_size = ETH_ALEN,
-    .max_entries = 1,
-};
-
-static __always_inline __u16
-csum_fold_helper(__u64 csum)
-{
-    int i;
-#pragma unroll
-    for (i = 0; i < 4; i++)
-    {
-        if (csum >> 16)
-            csum = (csum & 0xffff) + (csum >> 16);
-    }
-    return ~csum;
-}
-
-#define HOST_IP_ADDRESS (unsigned int)((172) + (17 << 8) + (0 << 16) + (1 << 24))
-#define BE_IP_ADDRESS (unsigned int)((172) + (17 << 8) + (0 << 16) + (2 << 24))
-#define LB_IP_ADDRESS (unsigned int)((172) + (17 << 8) + (0 << 16) + (4 << 24))
+#define IP_ADDRESS(x) (unsigned int)(172 + (17 << 8) + (0 << 16) + (x << 24))
+#define CLIENT_IP_ADDRESS IP_ADDRESS(CLIENT)
+#define LB_IP_ADDRESS IP_ADDRESS(LB)
+#define BE_A_IP_ADDRESS IP_ADDRESS(BACKEND_A)
+#define BE_B_IP_ADDRESS IP_ADDRESS(BACKEND_B)
 
 SEC("xdp_lb")
 int xdp_load_balancer(struct xdp_md *ctx)
 {
-    void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
-
-    struct ethhdr *eth;
-    struct iphdr *iph;
+    void *data_end = (void *)(long)ctx->data_end;
 
     int action = XDP_PASS;
 
-    bpf_printk("Got a packet");
-
-    // Packet starts with the ethernet header
-    eth = data;
-    if (eth + 1 > data_end)
-    {
+    struct ethhdr *eth = data;
+    if (data + sizeof(struct ethhdr) > data_end)
         return XDP_ABORTED;
-    }
 
-    // We are only interested in IP packets
-    unsigned short proto = bpf_ntohs(eth->h_proto);
-    if (proto != ETH_P_IP)
-    {
-        bpf_printk("Ethernet proto %d", proto);
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
         goto out;
-    }
 
-    // And then there's an IP header
-    iph = data + sizeof(*eth);
-    if (iph + 1 > data_end)
-    {
+    struct iphdr *iph = data + sizeof(struct ethhdr);
+    if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) > data_end)
         return XDP_ABORTED;
-    }
 
-    // We are only interested in TCP/IP
     if (iph->protocol != IPPROTO_TCP)
-    {
-        bpf_printk("IP proto %d", iph->protocol);
         goto out;
-    }
 
-    bpf_printk("Got a TCP packet");
-
-    // If the request comes from the host, redirect to a backend
-    if (iph->saddr == HOST_IP_ADDRESS)
+    if (iph->saddr == CLIENT_IP_ADDRESS)
     {
-        bpf_printk("Redirect to a backend");
-        bpf_printk("From %x", iph->saddr);
-        bpf_printk("To %x", BE_IP_ADDRESS);
-        iph->saddr = LB_IP_ADDRESS;
-        iph->daddr = BE_IP_ADDRESS;
-        eth->h_dest[5] = 2;
-        eth->h_source[5] = 4;
+        char be = BACKEND_A;
+        if (bpf_ktime_get_ns() % 2)
+            be = BACKEND_B;
+        bpf_printk("Forward to backend %d", be);
 
-        struct server *s;
-        s = bpf_map_lookup_elem(&backends, &iph->saddr);
-        if (!s)
-        {
-            bpf_printk("No server address in map");
-        }
-        else
-        {
-            bpf_printk("Server address in map");
-        }
+        iph->daddr = IP_ADDRESS(be);
+        eth->h_dest[5] = be;
     }
     else
     {
-        bpf_printk("Redirect to a host");
-        iph->daddr = HOST_IP_ADDRESS;
-        iph->saddr = LB_IP_ADDRESS;
-        eth->h_source[5] = 4;
-        eth->h_dest[0] = 0x02;
-        eth->h_dest[1] = 0x42;
-        eth->h_dest[2] = 0xa1;
-        eth->h_dest[3] = 0x70;
-        eth->h_dest[4] = 0x8e;
-        eth->h_dest[5] = 0xdf;
+        bpf_printk("Reply to client");
+        iph->daddr = CLIENT_IP_ADDRESS;
+        eth->h_dest[5] = CLIENT;
     }
 
-    iph->check = 0;
-    unsigned long long csum =
-        bpf_csum_diff(0, 0, (void *)iph, sizeof(*iph), 0);
-    iph->check = csum_fold_helper(csum);
+    iph->saddr = LB_IP_ADDRESS;
+    eth->h_source[5] = LB;
 
+    iph->check = iph_csum(iph);
     action = XDP_TX;
 
 out:
     return action;
 }
+
+// SEC("xdp_lb")
+// int xdp_load_balancer(struct xdp_md *ctx)
+// {
+//     int action = XDP_PASS;
+
+//     bpf_printk("Hello");
+
+//     void *data = (void *)(long)ctx->data;
+//     void *data_end = (void *)(long)ctx->data_end;
+
+//     struct ethhdr *eth = data;
+//     if (data + sizeof(*eth) > data_end)
+//         return XDP_ABORTED;
+
+//     if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+//         goto out;
+
+//     struct iphdr *iph = data + sizeof(*eth);
+//     if (data + sizeof(*eth) + sizeof(*iph) > data_end)
+//         return XDP_ABORTED;
+
+//     if (iph->protocol != IPPROTO_TCP)
+//         goto out;
+
+//     if (iph->saddr == CLIENT_IP_ADDRESS)
+//     {
+//         bpf_printk("Forward to backend");
+
+//         if (bpf_ktime_get_ns() % 2)
+//         {
+//             iph->daddr = BE_A_IP_ADDRESS;
+//             eth->h_dest[5] = BACKEND_A;
+//         }
+//         else
+//         {
+//             iph->daddr = BE_B_IP_ADDRESS;
+//             eth->h_dest[5] = BACKEND_B;
+//         }
+//     }
+//     else
+//     {
+//         bpf_printk("Return to client");
+//         iph->daddr = CLIENT_IP_ADDRESS;
+//         eth->h_dest[5] = CLIENT;
+//     }
+//     iph->saddr = LB_IP_ADDRESS;
+//     eth->h_source[5] = LB;
+
+//     iph->check = iph_csum(iph);
+//     action = XDP_TX;
+
+// out:
+//     return action;
+// }
 
 char _license[] SEC("license") = "GPL";
